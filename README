@@ -1,0 +1,13 @@
+AutoHome Automation Suite 
+
+Copyright (C) 2017, Diego Guerrero
+
+An HTTPS interface to IoT devices controlled through MQTT.
+
+Dependencies
+Mosquitto MQTT Broker, https://mosquitto.org/
+Paho MQTT Python Client, https://eclipse.org/paho/clients/python/
+SQLite3, https://www.sqlite.org/
+ESP8266 Arduino Core, http://esp8266.github.io/Arduino/
+PubSubClient embedded MQTT Client, http://pubsubclient.knolleary.net/
+Avahi, http://avahi.org/
