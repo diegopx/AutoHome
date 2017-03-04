@@ -6,11 +6,14 @@
 
 import flask
 import ssl
+import sys
+import json
 
 app = flask.Flask(__name__)
+credentials = None
 
 def check_authorization():
-	return flask.request.headers.get("Authorization") == "tPO8EmdwbGnFnADAPcqWbY8aYAsOre"
+	return flask.request.headers.get("Authorization") == credentials["psk"]
 
 @app.route("/static/sonoff-firmware.bin", methods=["GET"])
 def sonoff_firmware():
@@ -35,11 +38,20 @@ def access():
 	if not check_authorization():
 		flask.abort(404)
 	
-	return ("", 204, {"X-SSID": "Kaos86-ext", "X-PSK": "fKeZx/@bmW[h_rI.BlF42WX+Hjl"})
+	return ("", 204, {"X-SSID": credentials["wifi-ssid"], "X-PSK": credentials["wifi-pass"]})
 
-if __name__ == "__main__":
-	sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+def main():
+	try:
+		with open("credentials.json") as credfile:
+			credentials = json.loads(credfile.read())
+	except IOError:
+		print("Can't open credential file", file=sys.stderr)
+		return
 	
-	sslcontext.load_cert_chain("keys/local.crt", "keys/local.key")
+	sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+	sslcontext.load_cert_chain(credentials["certificate"], credentials["keyfile"])
 	
 	app.run(host="automation.local", port=8266, ssl_context=sslcontext, threaded=False, debug=False)
+
+if __name__ == "__main__":
+	main()
