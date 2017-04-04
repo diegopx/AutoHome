@@ -67,6 +67,121 @@ sensors = {
 	}
 }
 
+# This class could very well be split in two: RecurrentEvent and NonRecurrentEvent, but the whole
+# thing is so simple (and both databases and the text device interface don't understand hierarchy
+# directly) that it really does not warrant it;
+# if in the future it were to get more complex, you should do a proper taxonomy
+class Event(object):
+	"""Schedule item. Represents a command to be executed in the future."""
+	
+	def __init__(self, command, fuzzy=False, recurrent=False, firedate=None, weekday=None, hours=None, minutes=None):
+		"""Create a new event."""
+		if recurrent:
+			if weekday is None or hours is None or minutes is None:
+				raise ValueError("Weekday, hours and minutes must be set in a recurrent event")
+		else:
+			if firedate is None:
+				raise ValueError("Firedate must be set in a non-recurrent event")
+		
+		if firedate is not None and (weekday is not None or hours is not None or minutes is not None):
+			raise ValueError("Can't give both a firedate and a recurrent specification")
+		
+		self.command   = str(command)
+		self.fuzzy     = bool(fuzzy)
+		self.recurrent = bool(recurrent)
+		self.firedate  = int(firedate) if firedate is not None else 0
+		self.weekday   = int(weekday)  if weekday  is not None else 0
+		self.hours     = int(hours)    if hours    is not None else 0
+		self.minutes   = int(minutes)  if minutes  is not None else 0
+		
+		if recurrent:
+			if not (0 <= self.weekday <= 9 and 0 <= self.hours <= 23 and 0 <= self.minutes <= 59):
+				raise ValueError("Incorrect recurrent schedule specification")
+		else:
+			if self.firedate < 0:
+				raise ValueError("Firedate must be positive")
+	
+	@staticmethod
+	def create_once(command, fuzzy=False, firedate=0):
+		"""Create a new non-recurrent event."""
+		return Event(command, fuzzy=fuzzy, recurrent=False, firedate=firedate,
+		             weekday=None, hours=None, minutes=None)
+	
+	@staticmethod
+	def create_recurrent(command, fuzzy=False, weekday=0, hours=0, minutes=0):
+		"""Create a new recurrent event."""
+		return Event(command, fuzzy=fuzzy, recurrent=True, firedate=None,
+		             weekday=weekday, hours=hours, minutes=minutes)
+	
+	@staticmethod
+	def from_string(line):
+		"""Create a new event from a string description.
+		
+		The string must follow the following format:
+		For non-recurrent event, "timed (x|z) EpochTime Command", where
+		    the second char (x|z) indicates exact timer or fuzzy match (adds 16-minutes uniform noise)
+		    EpochTime is the number of seconds since 1 Jan 1970, 00:00:00
+		
+		For recurrent events, "recurrent (x|z)(0-9) Hour.Minutes Command", where
+		    the second char (x|z) indicates exact timer or fuzzy match (adds 16-minutes uniform noise)
+		    the third char indicates a day of the week Mon-Sun (1-7), every day (0),
+		    every weekday Mon-Fri (8) or weekends Sat-Sun (9)
+		    Hour indicates the hour in 24-hour format using a leading zero if necessary
+		    Minutes indicates the minutes using a leading zero if necessary
+		"""
+		
+		words = line.split(" ", 3)
+		
+		if len(words) != 4:
+			raise ValueError("Incorrect number of words in event descriptor")
+		
+		if words[0] == "timed":
+			recurrent = False
+			fuzzytext = words[1]
+			firedate  = words[2]
+			
+		elif words[0] == "recurrent":
+			if len(words[1]) != 2:
+				raise ValueError("Malformed fuzzy-weekday descriptor")
+			
+			recurrent = True
+			fuzzytext = words[1][0]
+			weekday   = words[1][1]
+			timecomp  = words[2].split(".")
+			
+			if len(timecomp) != 2:
+				raise ValueError("Malformed hour-minute descriptor")
+			
+			hours   = timecomp[0]
+			minutes = timecomp[1]
+		else:
+			raise ValueError("Unrecognized event type '" + words[0] + "'")
+		
+		if fuzzytext == "x":
+			fuzzy = False
+		elif fuzzytext == "z":
+			fuzzy= True
+		else:
+			raise ValueError("Unrecognized fuzzy descriptor")
+		
+		command = words[3]
+		
+		if recurrent:
+			return Event.create_once(command, fuzzy, firedate)
+		else:
+			return Event.create_recurrent(command, fuzzy, weekday, hours, minutes)
+	
+	def __str__(self):
+		"""Represent this event as string. The format is the same as the from_string method."""
+		fztext = "z" if self.fuzzy else "x"
+		
+		if self.recurrent:
+			return "recurrent {}{} {:02d}.{:02d} {}".format(fztext, self.weekday, self.hours,
+			                                                self.minutes, shlex.quote(self.command))
+		else:
+			return "timed {} {} {}".format(fztext, self.firedate, shlex.quote(self.command))
+	
+
 # Exceptions
 # ------------------------------------------------------------------------------
 
@@ -83,7 +198,7 @@ def setsignals():
 	signal.signal(signal.SIGTERM, gracefulexit)
 	signal.signal(signal.SIGHUP,  gracefulexit)
 
-def gracefulexit(signal, frame):
+def gracefulexit(signalnumber, frame):
 	"""Close the database, broker and client, and exit the program."""
 	
 	sys.exit(0)  # resources will be closed on their corresponding finally blocks
@@ -270,61 +385,36 @@ def setstatus(cursor, id, status):
 	
 	cursor.execute("update or ignore profile set status = ? where username = ?;", (status, id))
 
-def addscheduled(cursor, username, command, fuzzy=False, recurrent=False, firedate=None, weekday=None, hours=None, minutes=None):
+def addscheduled(cursor, username, event):
 	"""Add an event to the schedule in the database."""
 	
-	if recurrent:
-		if weekday is None or hours is None or minutes is None:
-			raise ValueError("Weekday, hours and minutes must be set in a recurrent event")
-	else:
-		if firedate is None:
-			raise ValueError("Firedate must be set in a non-recurrent event")
-	
-	if firedate is not None and (weekday is not None or hours is not None or minutes is not None):
-		raise ValueError("Can't give both a firedate and a recurrent specification")
-	
-	fuzzy     = 1 if fuzzy else 0
-	recurrent = 1 if recurrent else 0
-	firedate  = int(firedate) if firedate is not None else 0
-	weekday   = int(weekday)  if weekday  is not None else 0
-	hours     = int(hours)    if hours    is not None else 0
-	minutes   = int(minutes)  if minutes  is not None else 0
+	fuzzy     = 1 if event.fuzzy     else 0
+	recurrent = 1 if event.recurrent else 0
 	
 	cursor.execute("select count(*) from schedule where username = ? and command = ? and fuzzy = ? and "
 	               "  recurrent = ? and firedate = ? and weekday = ? and hours = ? and minutes = ?;",
-	               (username, command, fuzzy, recurrent, firedate, weekday, hours, minutes))
+	               (username, event.command, fuzzy, recurrent, event.firedate,
+	               event.weekday, event.hours, event.minutes))
 	
 	found = cursor.fetchone()
 	
 	if found[0] == 0:
 		cursor.execute("insert or ignore into schedule values (NULL, ?, ?, ?, ?, ?, ?, ?, ?);",
-		               (username, command, fuzzy, recurrent, firedate, weekday, hours, minutes))
+		               (username, event.command, event.fuzzy, event.recurrent, event.firedate,
+		               event.weekday, event.hours, event.minutes))
 	else:
 		print("this event is already in the schedule", file=sys.stderr)
 
-def delscheduled(cursor, username, command, fuzzy=False, recurrent=False, firedate=None, weekday=None, hours=None, minutes=None):
+def delscheduled(cursor, username, event):
 	"""Remove an event from the schedule in the database."""
 	
-	if recurrent:
-		if weekday is None or hours is None or minutes is None:
-			raise ValueError("Weekday, hours and minutes must be set in a recurrent event")
-	else:
-		if firedate is None:
-			raise ValueError("Firedate must be set in a non-recurrent event")
-	
-	if firedate is not None and (weekday is not None or hours is not None or minutes is not None):
-		raise ValueError("Can't give both a firedate and a recurrent specification")
-	
-	fuzzy     = 1 if fuzzy else 0
-	recurrent = 1 if recurrent else 0
-	firedate  = int(firedate) if firedate is not None else 0
-	weekday   = int(weekday)  if weekday  is not None else 0
-	hours     = int(hours)    if hours    is not None else 0
-	minutes   = int(minutes)  if minutes  is not None else 0
+	fuzzy     = 1 if event.fuzzy     else 0
+	recurrent = 1 if event.recurrent else 0
 	
 	cursor.execute("delete from schedule where username = ? and command = ? and fuzzy = ? and "
 	               "recurrent = ? and firedate = ? and weekday = ? and hours = ? and minutes = ?;",
-	               (username, command, fuzzy, recurrent, firedate, weekday, hours, minutes))
+	               (username, event.command, fuzzy, recurrent, event.firedate,
+	               event.weekday, event.hours, event.minutes))
 
 def clearschedule(cursor, username):
 	"""Clear any scheduled event for a particular username."""
@@ -395,65 +485,60 @@ def _devschedule0(cursor, displayname):
 	
 	cursor.execute("select command, fuzzy, recurrent, firedate, weekday, hours, minutes from schedule where username = ?;", (username,))
 	
-	event = cursor.fetchone()
+	row = cursor.fetchone()
 	
-	while event:
-		data = dict()
-		data["command"]   = event[0]
-		data["fuzzy"]     = event[1]
-		data["recurrent"] = event[2]
+	while row:
+		recurrent = (row[2] == '1')
 		
-		if data["recurrent"]:
-			data["weekday"] = event[4]
-			data["hours"]   = event[5]
-			data["minutes"] = event[6]
+		if recurrent:
+			event = Event.create_recurrent(row[0], row[1] == '1', row[4], row[5], row[6])
 		else:
-			data["firedate"] = event[3]
+			event = Event.create_once(row[0], row[1] == '1', row[3])
 		
-		yield data
+		yield event
 		
-		event = cursor.fetchone()
+		row = cursor.fetchone()
 
 # Device interaction
 # ------------------------------------------------------------------------------
 
-def validcommand(type, command, status):
+def validcommand(stype, command, status):
 	"""Check whether it is acceptable to send a given command to a device of the given type and status."""
 	
-	if type in sensors:
-		if callable(sensors[type]["commands"]):
-			return sensors[type]["commands"](command, status)
+	if stype in sensors:
+		if callable(sensors[stype]["commands"]):
+			return sensors[stype]["commands"](command, status)
 		else:
-			return command in sensors[type]["commands"]
+			return command in sensors[stype]["commands"]
 	
 	return False
 
-def validstatus(type, status):
+def validstatus(stype, status):
 	"""Check whether a status is acceptable for a device of a given type."""
 	
-	if type in sensors:
-		if callable(sensors[type]["status"]):
-			return sensors[type]["status"](status)
+	if stype in sensors:
+		if callable(sensors[stype]["status"]):
+			return sensors[stype]["status"](status)
 		else:
-			return status in sensors[type]["status"]
+			return status in sensors[stype]["status"]
 	
 	return False
 
-def statustransform(type, command, status):
+def statustransform(stype, command, status):
 	"""Deduce the status that a command will leave a device in.
 	
 	The type and command must be correct, otherwise the behaviour is undefined.
 	"""
 	
-	if type in sensors:
-		if callable(sensors[type]["transform"]):
-			return sensors[type]["transform"](command, status)
+	if stype in sensors:
+		if callable(sensors[stype]["transform"]):
+			return sensors[stype]["transform"](command, status)
 		else:
-			return sensors[type]["transform"].get(command, None)
+			return sensors[stype]["transform"].get(command, None)
 	
 	return None
 
-def add_device(userdata, id, displayname=None, type="device", status=""):
+def add_device(userdata, id, displayname=None, stype="device", status=""):
 	"""Add a device profile to the database and notify the device of its new credentials."""
 	
 	database    = userdata["database"]
@@ -466,15 +551,15 @@ def add_device(userdata, id, displayname=None, type="device", status=""):
 		print("there's no " + id + " in the lobby", file=sys.stderr)
 		return
 	
-	if type not in sensors:
+	if stype not in sensors:
 		print("not a valid device type", file=sys.stderr)
 		return
 	
-	if not validstatus(type, status):
+	if not validstatus(stype, status):
 		print("not a valid status for the given device type", file=sys.stderr)
 		return
 	
-	password = addprofile(cursor, id, displayname, type, True, status)
+	password = addprofile(cursor, id, displayname, stype, True, status)
 	
 	database.commit()
 	
@@ -592,15 +677,15 @@ def exec_command(userdata, displayname, command):
 		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
 		return
 	
-	type   = row[0]
+	stype  = row[0]
 	status = row[1]
 	
-	if not validcommand(type, command, status):
-		print("invalid command " + str(command) + " for type " + str(type) +
+	if not validcommand(stype, command, status):
+		print("invalid command " + str(command) + " for type " + str(stype) +
 		      " and status " + str(status), file=sys.stderr)
 		return
 	
-	newstatus = statustransform(type, command, status)
+	newstatus = statustransform(stype, command, status)
 	
 	if newstatus is not None:
 		setstatus(cursor, username, newstatus)
@@ -609,8 +694,8 @@ def exec_command(userdata, displayname, command):
 	                                                       # that may not be idempotent, but PubSubClient doesn't
 	                                                       # support it (and it's too heavyweight anyway)
 
-def schedule_once(userdata, displayname, firedate, fuzzy, command):
-	"""Add an operation to be performed once at a particular time to a device's schedule."""
+def schedule_device(userdata, displayname, event):
+	"""Add an operation to be performed represented in an event dictionary to a device's schedule."""
 	
 	cursor      = userdata["cursor"]
 	client      = userdata["client"]
@@ -633,67 +718,26 @@ def schedule_once(userdata, displayname, firedate, fuzzy, command):
 		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
 		return
 	
-	type   = row[0]
+	stype  = row[0]
 	status = row[1]
 	
-	if not validcommand(type, command, status):
-		print("invalid command " + str(command) + " for type " + str(type) +
+	if not validcommand(stype, event.command, status):
+		print("invalid command " + str(event.command) + " for type " + str(stype) +
 		      " and status " + str(status), file=sys.stderr)
-		return
-	
-	firedate = int(firedate)
-	
-	client.publish(username + "/control", "timed +" + ('z' if fuzzy else 'x') + " " + str(int(firedate)) + " " + command, qos=1)
-	
-	addscheduled(cursor, username, command, fuzzy, recurrent=False, firedate=firedate)
-
-def schedule_recurrent(userdata, displayname, weekday, hours, minutes, fuzzy, command):
-	"""Add an operation to be performed recurrently to a device's schedule."""
-	
-	cursor      = userdata["cursor"]
-	client      = userdata["client"]
-	credentials = userdata["credentials"]
-	username    = getusername(cursor, displayname)
-	
-	if username is None:
-		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
-		return
-	
-	if username == credentials["username"]:
-		print("the schedule is for devices", file=sys.stderr)
 		return
 		
-	cursor.execute("select type, status from profile where username = ?;", (username,))
+	eventstr = str(event)
 	
-	row = cursor.fetchone()
+	if event.recurrent:
+		eventstr = eventstr[:10] + "+" + eventstr[10:]
+	else:
+		eventstr = eventstr[:6] + "+" + eventstr[6:]
 	
-	if row is None:
-		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
-		return
-	
-	type   = row[0]
-	status = row[1]
-	
-	if not validcommand(type, command, status):
-		print("invalid command " + str(command) + " for type " + str(type) +
-		      " and status " + str(status), file=sys.stderr)
-		return
-	
-	weekday = int(weekday)
-	hours   = int(hours)
-	minutes = int(minutes)
-	
-	if weekday < 0 or weekday > 9 or hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
-		print("incorrect recurrent schedule specification", file=sys.stderr)
-		return
-	
-	client.publish(username + "/control", "recurrent +" + ('z' if fuzzy else 'x') + str(weekday) + " "
-	               + "{0:02d}.{1:02d}".format(hours, minutes) + " " + str(command), qos=1)
-	
-	addscheduled(cursor, username, command, fuzzy, recurrent=True, weekday=weekday, hours=hours, minutes=minutes)
+	client.publish(username + "/control", str(event), qos=1)
+	addscheduled(cursor, username, event)
 
-def unschedule_once(userdata, displayname, firedate, fuzzy, command):
-	"""Remove an operation to be performed once at a particular time from a device's schedule."""
+def unschedule_device(userdata, displayname, event):
+	"""Add an operation to be performed represented in an event dictionary to a device's schedule."""
 	
 	cursor   = userdata["cursor"]
 	client   = userdata["client"]
@@ -711,59 +755,23 @@ def unschedule_once(userdata, displayname, firedate, fuzzy, command):
 		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
 		return
 	
-	type   = row[0]
+	stype  = row[0]
 	status = row[1]
 	
-	if not validcommand(type, command, status):
-		print("invalid command " + str(command) + " for type " + str(type) +
+	if not validcommand(stype, event.command, status):
+		print("invalid command " + str(event.command) + " for type " + str(stype) +
 		      " and status " + str(status), file=sys.stderr)
-		return
-	
-	firedate = int(firedate)
-	
-	client.publish(username + "/control", "timed -" + ('z' if fuzzy else 'x') + " " + str(int(firedate)) + " " + command, qos=1)
-	
-	delscheduled(cursor, username, command, fuzzy, recurrent=False, firedate=firedate)
-
-def unschedule_recurrent(userdata, displayname, weekday, hours, minutes, fuzzy, command):
-	"""Remove an operation to be performed recurrently from a device's schedule."""
-	
-	cursor   = userdata["cursor"]
-	client   = userdata["client"]
-	username = getusername(cursor, displayname)
-	
-	if username is None:
-		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
 		return
 		
-	cursor.execute("select type, status from profile where username = ?;", (username,))
+	eventstr = str(event)
 	
-	row = cursor.fetchone()
+	if event.recurrent:
+		eventstr = eventstr[:10] + "-" + eventstr[10:]
+	else:
+		eventstr = eventstr[:6] + "-" + eventstr[6:]
 	
-	if row is None:
-		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
-		return
-	
-	type   = row[0]
-	status = row[1]
-	
-	if not validcommand(type, command, status):
-		print("invalid command " + str(command) + " for type " + str(type) +
-		      " and status " + str(status), file=sys.stderr)
-		return
-	
-	weekday = int(weekday)
-	hours   = int(hours)
-	minutes = int(minutes)
-	
-	if weekday < 0 or weekday > 9 or hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
-		print("incorrect recurrent schedule specification", file=sys.stderr)
-		return
-	
-	client.publish(username + "/control", "recurrent -" + ('z' if fuzzy else 'x') + str(weekday) + " "
-	               + "{0:02d}.{1:02d}".format(hours, minutes) + " " + str(command), qos=1)
-	
-	delscheduled(cursor, username, command, fuzzy, recurrent=True, weekday=weekday, hours=hours, minutes=minutes)
+	client.publish(username + "/control", str(event), qos=1)
+	addscheduled(cursor, username, event)
 
 def clearschedule_device(userdata, displayname):
 	"""Remove all events for a device from the local database and the device's database."""
@@ -778,6 +786,94 @@ def clearschedule_device(userdata, displayname):
 	
 	client.publish(username + "/control", "clear", qos=1)
 	clearschedule(cursor, username)
+
+def askschedule_device(userdata, displayname):
+	"""Ask the device for its current schedule."""
+	
+	cursor   = userdata["cursor"]
+	client   = userdata["client"]
+	username = getusername(cursor, displayname)
+	
+	if username is None:
+		print("can't find user " + shlex.quote(str(displayname)), file=sys.stderr)
+		return
+	
+	client.publish(username + "/admin", "asksschedule", qos=0)
+
+def schedule_makeconsistent(userdata, username, deviceschedule):
+	"""Check that the device internal schedule and the database schedule are the same.
+	If not, send the necessary messages to the device to fix its schedule (database supersedes).
+	"""
+	
+	cursor      = userdata["cursor"]
+	displayname = getdisplayname(cursor, username)
+	
+	if displayname is None:
+		print("can't find username " + shlex.quote(str(username)), file=sys.stderr)
+		return
+	
+	dbschedule = devschedule(cursor, displayname)
+	parsed     = parseschedule(deviceschedule)
+	
+	if parsed is None:
+		print("invalid device schedule descriptor", file=sys.stderr)
+		return
+	
+	deviceschedule, capacity = parsed
+	
+	diffextra   = [event for event in deviceschedule if not event in dbschedule]
+	diffmissing = [event for event in dbschedule     if not event in deviceschedule]
+	
+	if len(dbschedule) > capacity:
+		print("can't fix device: database schedule event count (" + str(len(dbschedule)) + ") " +
+		"is bigger than the maximum schedule memory of the device (" + str(capacity) + ")")
+		return
+	
+	# note that extras must be removed before adding missing events
+	# otherwise we may exceed the maximum schedule size for the device
+	
+	for event in diffextra:
+		unschedule_device(userdata, displayname, event)
+	
+	for event in diffmissing:
+		schedule_device(userdata, displayname, event)
+
+def parseschedule(text):
+	"""Parse a schedule descriptor (coming from the device) into an appropriate list.
+	
+	Returns:
+		(events, capacity) events.   A list of event object descriptors.
+		                   capacity. The max number of scheduled events in this device.
+	"""
+	
+	lines = text.split("\n")
+	
+	if len(lines) < 1:
+		return None
+	
+	header = lines[0].split("/")
+	
+	if len(header) != 2:
+		return None
+	
+	try:
+		nevents  = int(header[0])
+		capacity = int(header[1])
+	except ValueError:
+		return None
+	
+	if nevents != len(lines) - 1:
+		return None
+	
+	events = []
+	
+	try:
+		for line in lines[1:]:
+			events.append(Event.from_string(line))
+	except ValueError:
+		return None
+	
+	return (events, capacity)
 
 # MQTT
 # ------------------------------------------------------------------------------
@@ -795,7 +891,7 @@ def onconnect(client, userdata, rc):
 		client.subscribe("#", qos=0)
 		users = userlist(cursor)
 		
-		for (username, connected) in users:
+		for (username, _) in users:
 			setconnected(cursor, username, False)
 			client.publish(username + "/lobby", "ping")
 		
@@ -859,6 +955,8 @@ def onmessage(client, userdata, message):
 			if data.startswith("status"):
 				setstatus(cursor, username, data[7:])  # strip "status "
 				database.commit()
+			elif data.startswith("schedule"):
+				schedule_makeconsistent(userdata, username, data[9:])  # strip "schedule\n"
 	
 	print(file=sys.stderr)
 
@@ -882,93 +980,28 @@ def kickuser(credentials, username, password):
 def processline(userdata, line):
 	"""Read a line from stdin and execute the corresponding command."""
 	
+	def processcmd(command, args, expected_nargs, delegate):
+		"""Validate the number of arguments and call a delegate handler."""
+		
+		if len(args) != expected_nargs:
+			raise FormatError("Wrong number of arguments for '" + command + "', expected " +
+			                  str(expected_nargs) + " but got " + str(len(args)))
+			
+		delegate(userdata, *args)
+	
 	# commands should use double quotes if an argument has spaces in it and escape internal double quotes as necessary
 	tokens = shlex.split(line)
 	if len(tokens) < 1:
 		return
 	
-	command = tokens[0]
-	args    = tokens[1:]
+	cmd  = tokens[0]
+	args = tokens[1:]
 	
+	# Specialized handlers; they bridge the user facing interface and the internal implementations;
+	# see the command dictionary below for more information on each operation
 	
-	if command == "add":
-		# add <guestname> <displayname> <type> <status>
-		# add a device to the network
-		
-		if len(args) != 4:
-			raise FormatError("Wrong number of arguments for 'add', expected 4 but got " + str(len(args)))
-		
-		add_device(userdata, args[0], args[1], args[2], args[3])
-		
-	elif command == "rename":
-		# rename <displayname> <newdisplayname>
-		# change the public display name of a device in the network
-		
-		if len(args) != 2:
-			raise FormatError("Wrong number of arguments for 'del', expected 1 but got " + str(len(args)))
-		
-		rename_device(userdata, args[0], args[1])
-		
-	elif command == "del":
-		# del <displayname>
-		# delete a device from the network
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'del', expected 1 but got " + str(len(args)))
-		
-		del_device(userdata, args[0])
-		
-	elif command == "sync":
-		# sync <displayname>
-		# send a time synchronization message to the specified device
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'sync', expected 1 but got " + str(len(args)))
-		
-		sync_device(userdata, args[0])
-		
-	elif command == "ping":
-		# ping <displayname>
-		# check a device is still responsive by sending a ping message
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'ping', expected 1 but got " + str(len(args)))
-		
-		ping_device(userdata, args[0])
-		
-	elif command == "askstatus":
-		# askstatus <displayname>
-		# ask the device for its current status
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'status', expected 1 but got " + str(len(args)))
-		
-		askstatus_device(userdata, args[0])
-		
-	elif command == "cmd":
-		# cmd <displayname> <operation>
-		# send immediate command to device;
-		# arguments to the operation should be within the operation argument, e.g. 'dimmer 126'
-		# the operation must be valid (and have valid arguments) for the device type;
-		# otherwise, the command will fail silently
-		
-		if len(args) != 2:
-			raise FormatError("Wrong number of arguments for 'cmd', expected 2 but got " + str(len(args)))
-		
-		exec_command(userdata, args[0], args[1])
-		
-	elif command == "timed":
-		# timed (add|del) <displayname> <date> (exact|fuzzy) <operation>
-		# schedule a command for the future;
-		# 'add' indicates to add the operation to the schedule, 'del' indicates to remove it from it;
-		# <date> must be formatted as a unix integer timestamp in the future,
-		# otherwise the command is a no-op;
-		# 'exact' sets the timer for the specific timestamp; 'fuzzy' adds a small amount of time noise;
-		# <operation> and <args> follow the same rules as the 'cmd' message;
-		
-		if len(args) != 5:
-			raise FormatError("Wrong number of arguments for 'timed', expected 5 but got " + str(len(args)))
-		
+	def timed_handler(userdata, *args):
+		"""Accomodate the input for a non-recurrent event."""
 		fuzzy = False
 		
 		if args[3] == "exact":
@@ -978,26 +1011,17 @@ def processline(userdata, line):
 		else:
 			raise FormatError("Expected 'fuzzy' or 'exact' but found '" + args[3] + "' instead.")
 		
+		event = Event.create_once(args[4], fuzzy, args[2])
+		
 		if args[0] == "add":
-			schedule_once(userdata, args[1], int(args[2]), fuzzy, args[4])
+			schedule_device(userdata, args[1], event)
 		elif args[0] == "del":
-			unschedule_once(userdata, args[1], int(args[2]), fuzzy, args[4])
+			unschedule_device(userdata, args[1], event)
 		else:
 			raise FormatError("Expected 'add' or 'del' but found '" + args[0] + "' instead.")
-		
-	elif command == "recurrent":
-		# recurrent (add|del) <displayname> <weekday> <hours> <minutes> (exact|fuzzy) <operation>
-		# schedule a recurrent command for the future;
-		# 'add' indicates to add the operation to the schedule, 'del' indicates to remove it from it;
-		# <weekday> must be a number between 0 and 9. Passing 0 signals the operation should execute
-		# every day; 1-7 signal it should be executed on Mon-Sun respectively; 8 signals Mon-Fri; and
-		# 9 signals Sat-Sun;
-		# 'exact' sets the timer for the specific timestamp; 'fuzzy' adds a small amount of time noise;
-		# <operation> and <args> follow the same rules as the 'cmd' message
-		
-		if len(args) != 7:
-			raise FormatError("Wrong number of arguments for 'recurrent', expected 7 but got " + str(len(args)))
-		
+	
+	def recurrent_handler(userdata, *args):
+		"""Accomodate the input for a recurrent event."""
 		fuzzy = False
 		
 		if args[5] == "exact":
@@ -1007,32 +1031,17 @@ def processline(userdata, line):
 		else:
 			raise FormatError("Expected 'fuzzy' or 'exact' but found '" + args[5] + "' instead.")
 		
+		event = Event.create_recurrent(args[6], fuzzy, args[2], args[3], args[4])
+		
 		if args[0] == "add":
-			schedule_recurrent(userdata, args[1], int(args[2]), int(args[3]), int(args[4]), fuzzy, args[6])
+			schedule_device(userdata, args[1], event)
 		elif args[0] == "del":
-			unschedule_recurrent(userdata, args[1], int(args[2]), int(args[3]), int(args[4]), fuzzy, args[6])
+			unschedule_device(userdata, args[1], event)
 		else:
 			raise FormatError("Expected 'add' or 'del' but found '" + args[0] + "' instead.")
-		
-	elif command == "clear":
-		# clear <displayname>
-		# clear the schedule for a given device
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'clear', expected 1 but got " + str(len(args)))
-		
-		clearschedule_device(userdata, args[0])
-		
-	elif command == "devlist":
-		# devlist
-		# retrieve verified device list
-		# respond with a list of devices, using the format: ('(-|+)<displayname>' )*
-		# where every name is prepended with a positive sign '+' if the device is connected
-		# and a negative sign '-' if it is not
-		
-		if len(args) != 0:
-			raise FormatError("Wrong number of arguments for 'devlist', expected none but got " + str(len(args)))
-		
+	
+	def devlist_handler(userdata, *args):
+		"""Transform the raw devlist into a human readable list."""
 		for (device, connected) in devlist(userdata["cursor"]):
 			if device == "devmaster":
 				continue
@@ -1043,62 +1052,111 @@ def processline(userdata, line):
 				print(shlex.quote("-" + device), end=" ")
 		
 		print()
-		
-	elif command == "guestlist":
-		# guestlist
-		# retrieve the guestlist
-		# respond with a list of unverified devices, using the format ('<displayname>' )*
-		# note that every guest is connected (otherwise it would just be removed from the list)
-		
-		if len(args) != 0:
-			raise FormatError("Wrong number of arguments for 'guestlist', expected none but got " + str(len(args)))
-		
+	
+	def guestlist_handler(userdata, *args):
+		"""Transform the raw guestlist into a human readable list."""
 		for guest in userdata["guestlist"]:
 			print(shlex.quote(guest), end=" ")
 		
 		print()
+	
+	def info_handler(userdata, *args):
+		"""Transform the raw info list into a human readable list."""
+		stype, connected, status = devinfo(userdata["cursor"], args[0])
 		
-	elif command == "info":
-		# info <displayname>
-		# retrieve device profile
-		# respond with the list of device properties in the profile using the format
-		# <connected><type> <status>
-		# where connected is formatted as + if the device is connected as - if it is not, e.g.
-		# '-sonoff on' indicates a disconnected sonoff device with a status of 'on'
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'info', expected 1 but got " + str(len(args)))
-		
-		type, connected, status = devinfo(userdata["cursor"], args[0])
-		
-		print(shlex.quote(("+" if connected else "-") + type), end=" ")
+		print(shlex.quote(("+" if connected else "-") + stype), end=" ")
 		print(shlex.quote(status))
-		
-	elif command == "schedule":
-		# schedule <displayname>
-		# retrieve device schedule
-		# respond with a list of scheduled commands for the given device using the formats
-		# timed <date> (exact|fuzzy) <operation> <args>
-		# recurrent <weekday> <hours> <minutes> (exact|fuzzy) <operation> [<args>]
-		# for timed and recurrent operations respectively;
-		# the specifics of each formats are the same as for their schedule counterparts
-		
-		if len(args) != 1:
-			raise FormatError("Wrong number of arguments for 'schedule', expected 1 but got " + str(len(args)))
-		
+	
+	def schedule_handler(userdata, *args):
+		"""Transform the raw schedule list into a human readable list."""
 		for event in devschedule(userdata["cursor"], args[0]):
-			fztext = "fuzzy" if event["fuzzy"] else "exact"
-			
-			if event["recurrent"]:
-				print("recurrent", shlex.quote(str(event["weekday"])), shlex.quote(str(event["hours"])),
-				      shlex.quote(str(event["minutes"])), shlex.quote(fztext), shlex.quote(event["command"]))
-			else:
-				print("timed", shlex.quote(str(event["firedate"])),
-				      shlex.quote(fztext), shlex.quote(event["command"]))
+			print(str(event))
 		
 		print("")
-	else:
+	
+	# Command dictionary
+	
+	commands = {
+		# "command name": (expected_nargs, delegate)
+		"add": (4, add_device),
+			# add <guestname> <displayname> <type> <status>
+			# add a device to the network
+		"rename": (2, rename_device),
+			# rename <displayname> <newdisplayname>
+			# change the public display name of a device in the network
+		"del": (1, del_device),
+			# del <displayname>
+			# delete a device from the network
+		"sync": (1, sync_device),
+			# sync <displayname>
+			# send a time synchronization message to the specified device
+		"ping": (1, ping_device),
+			# ping <displayname>
+			# check a device is still responsive by sending a ping message
+		"askstatus": (1, askstatus_device),
+			# askstatus <displayname>
+			# ask the device for its current status
+		"cmd": (2, exec_command),
+			# cmd <displayname> <operation>
+			# send immediate command to device;
+			# arguments to the operation should be within the operation argument, e.g. 'dimmer 126'
+			# the operation must be valid (and have valid arguments) for the device type;
+			# otherwise, the command will fail silently
+		"timed": (5, timed_handler),
+			# timed (add|del) <displayname> <date> (exact|fuzzy) <operation>
+			# schedule a command for the future;
+			# 'add' indicates to add the operation to the schedule, 'del' indicates to remove it from it;
+			# <date> must be formatted as a unix integer timestamp in the future,
+			# otherwise the command is a no-op;
+			# 'exact' sets the timer for the specific timestamp; 'fuzzy' adds a small amount of time noise;
+			# <operation> and <args> follow the same rules as the 'cmd' message;
+		"recurrent": (7, recurrent_handler),
+			# recurrent (add|del) <displayname> <weekday> <hours> <minutes> (exact|fuzzy) <operation>
+			# schedule a recurrent command for the future;
+			# 'add' indicates to add the operation to the schedule, 'del' indicates to remove it from it;
+			# <weekday> must be a number between 0 and 9. Passing 0 signals the operation should execute
+			# every day; 1-7 signal it should be executed on Mon-Sun respectively; 8 signals Mon-Fri; and
+			# 9 signals Sat-Sun;
+			# 'exact' sets the timer for the specific timestamp; 'fuzzy' adds a small amount of time noise;
+			# <operation> and <args> follow the same rules as the 'cmd' message
+		"clear": (1, clearschedule_device),
+			# clear <displayname>
+			# clear the schedule for a given device
+		"devlist": (0, devlist_handler),
+			# devlist
+			# retrieve verified device list
+			# respond with a list of devices, using the format: ('(-|+)<displayname>' )*
+			# where every name is prepended with a positive sign '+' if the device is connected
+			# and a negative sign '-' if it is not
+		"guestlist": (0, guestlist_handler),
+			# guestlist
+			# retrieve the guestlist
+			# respond with a list of unverified devices, using the format ('<displayname>' )*
+			# note that every guest is connected (otherwise it would just be removed from the list)
+		"info": (1, info_handler),
+			# info <displayname>
+			# retrieve device profile
+			# respond with the list of device properties in the profile using the format
+			# <connected><type> <status>
+			# where connected is formatted as + if the device is connected as - if it is not, e.g.
+			# '-sonoff on' indicates a disconnected sonoff device with a status of 'on'
+		"schedule": (1, schedule_handler)
+			# schedule <displayname>
+			# retrieve device schedule
+			# respond with a list of scheduled commands for the given device using the formats
+			# timed <date> (exact|fuzzy) <operation> <args>
+			# recurrent <weekday> <hours> <minutes> (exact|fuzzy) <operation> [<args>]
+			# for timed and recurrent operations respectively;
+			# the specifics of each formats are the same as for their schedule counterparts
+	}
+	
+	try:
+		(expected_nargs, delegate) = commands[cmd]
+	except KeyError:
 		print("Unrecognized command, skipping", file=sys.stderr)
+		return
+	
+	processcmd(cmd, args, expected_nargs, delegate)
 
 def genconfig(infilename, definitions, outfilename):
 	"""Generate an appropriate Mosquitto configuration file."""
@@ -1111,6 +1169,69 @@ def genconfig(infilename, definitions, outfilename):
 	
 	with open(outfilename, "w") as outfile:
 		outfile.write(text)
+
+def loop(mosquitto, credentials, database, cursor, guestlist, logger):
+	"""Main MQTT/REST API event loop."""
+	
+	userdata = {"done": False, "database": database, "cursor": cursor,
+	            "credentials": credentials, "client": None, "guestlist": guestlist}
+	client   = None
+	
+	try:
+		client = mqtt.Client(userdata=userdata)
+		client.username_pw_set(credentials["username"], credentials["password"])
+		client.on_connect    = onconnect
+		client.on_disconnect = ondisconnect
+		client.on_message    = onmessage
+		userdata["client"]   = client
+		
+		client.tls_set(credentials["certificate"])
+		client.connect(credentials["hostname"], credentials["port"], keepalive=300)
+		mqttsocket = client.socket()
+		
+		print("AutoHome public interface started", file=sys.stderr)
+		
+		while not userdata["done"]:
+			try:
+				# timeout is set to a value lesser than the keepalive period, otherwise
+				# loop_misc() may not be called on time and the server can close the connection
+				available = select.select([sys.stdin, mqttsocket, mosquitto.stderr], [], [], 30)
+				
+				if mqttsocket in available[0]:
+					client.loop_read()
+				
+				if sys.stdin in available[0]:
+					try:
+						processline(userdata, input())
+						database.commit()
+					except FormatError as e:
+						print("Error processing line: " + str(e), file=sys.stderr)
+					except EOFError as e:
+						userdata["done"] = True
+				
+				if client.want_write():
+					client.loop_write()
+				
+				client.loop_misc()
+				
+				if mosquitto.stderr in available[0]:
+					line = mosquitto.stderr.readline()
+					logger.debug(line.strip().decode("utf8"))
+				
+			except (KeyboardInterrupt, SystemExit):
+				raise
+			except Exception as e:
+				print("Unexpected exception", file=sys.stderr)
+				print(e, file=sys.stderr)
+				traceback.print_tb(e.__traceback__, file=sys.stderr)
+				time.sleep(10)  # instead of crashing and losing everything, try to continue;
+				                # if the problem was transient, the error is logged and the 
+				                # system is still available; if the problem is fatal,
+				                # wait so as to not generate infinite logfiles with
+				                # succesive exceptions, e.g. because the sql database has
+				                # been corrupted and every attempt to access it fails
+	finally:
+		client.disconnect()
 
 def main():
 	"""Program entry point."""
@@ -1159,64 +1280,7 @@ def main():
 				
 				print("MQTT broker started", file=sys.stderr)
 				
-				userdata = {"done": False, "database": database, "cursor": cursor, "credentials": credentials, "client": None, "guestlist": guestlist}
-				client   = None
-				
-				try:
-					client = mqtt.Client(userdata=userdata)
-					client.username_pw_set(credentials["username"], credentials["password"])
-					client.on_connect    = onconnect
-					client.on_disconnect = ondisconnect
-					client.on_message    = onmessage
-					userdata["client"]   = client
-					
-					client.tls_set(credentials["certificate"])
-					client.connect(credentials["hostname"], credentials["port"], keepalive=300)
-					mqttsocket = client.socket()
-					
-					print("AutoHome public interface started", file=sys.stderr)
-					
-					while not userdata["done"]:
-						try:
-							# timeout is set to a value lesser than the keepalive period, otherwise
-							# loop_misc() may not be called on time and the server can close the connection
-							available = select.select([sys.stdin, mqttsocket, mosquitto.stderr], [], [], 30)
-							
-							if mqttsocket in available[0]:
-								client.loop_read()
-							
-							if sys.stdin in available[0]:
-								try:
-									processline(userdata, input())
-									database.commit()
-								except FormatError as e:
-									print("Error processing line: " + str(e), file=sys.stderr)
-								except EOFError as e:
-									userdata["done"] = True
-							
-							if client.want_write():
-								client.loop_write()
-							
-							client.loop_misc()
-							
-							if mosquitto.stderr in available[0]:
-								line = mosquitto.stderr.readline()
-								logger.debug(line.strip().decode("utf8"))
-							
-						except (KeyboardInterrupt, SystemExit):
-							raise
-						except Exception as e:
-							print("Unexpected exception", file=sys.stderr)
-							print(e, file=sys.stderr)
-							traceback.print_tb(e.__traceback__, file=sys.stderr)
-							time.sleep(10)  # instead of crashing and losing everything, try to continue;
-							                # if the problem was transient, the error is logged and the 
-							                # system is still available; if the problem is fatal,
-							                # wait so as to not generate infinite logfiles with
-							                # succesive exceptions, e.g. because the sql database has
-							                # been corrupted and every attempt to access it fails
-				finally:
-					client.disconnect()
+				loop(mosquitto, credentials, database, cursor, guestlist, logger)
 			finally:
 				mosquitto.terminate()
 				

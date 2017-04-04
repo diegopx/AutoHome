@@ -101,6 +101,12 @@ uint64_t nextfire[maxnscheduled];
 // Auxiliar functions
 // ------------------------------------------------------------------------------
 
+// return the minimum between two values
+int min(int a, int b)
+{
+	return (a < b) ? a : b;
+}
+
 // calculate crc32 checksum (to validate hardware integrity, do not use for security)
 uint32_t crc32(void* data, int size)
 {
@@ -218,6 +224,34 @@ uint64_t readull(const char* str, const char** stop)
 	}
 	
 	return value;
+}
+
+// write an unsigned 64 bit integer to a string
+// return the number of bytes written
+// no boundaries checks so make sure you have enough room (20 bytes in the worst case)
+int writeull(char* dst, uint64_t value)
+{
+	char* c = dst;
+	
+	while (value > 0) {
+		*c     = value % 10 + '0';
+		value /= 10;
+		
+		c += 1;
+	}
+	
+	int len = c - dst;
+	
+	while (dst < c) {
+		char tmp = *dst;
+		*dst     = *c;
+		*c       = tmp;
+		
+		dst += 1;
+		c   -= 1;
+	}
+	
+	return len;
 }
 
 // day of the week where 1 = Monday ... 7 = Sunday
@@ -369,8 +403,8 @@ void resetconfig()
 // ------------------------------------------------------------------------------
 
 Ticker      sticker;
-const char* report_status;              // if not null, indicates a status response should be sent and
-                                        // the status line corresponds to this string
+const char* report_status;  // if not null, indicates a status response should be sent and
+                            // the status line corresponds to this string
 
 // update the value of curdate;
 // should be called at least every 49 days (otherwise it would skip an millis() overflow)
@@ -640,12 +674,13 @@ void scallback()
 // MQTT
 // ------------------------------------------------------------------------------
 
-char lobbytopic  [maxcfgstrsize + 10];  // cached lobby topic   "<username>/lobby"
-char controltopic[maxcfgstrsize + 10];  // cached control topic "<username>/topic"
-char admintopic  [maxcfgstrsize + 10];  // cached admin topic   "<username>/admin"
-bool mqtt_hascreds;                     // true if the device remembers a user and password for MQTT
-bool should_reconnect;                  // true if enough time has pass to reconnect to the MQTT broker
-bool should_ping;                       // true if the mqtt client should pingback as soon as possible
+char  lobbytopic  [maxcfgstrsize + 10];  // cached lobby topic   "<username>/lobby"
+char  controltopic[maxcfgstrsize + 10];  // cached control topic "<username>/topic"
+char  admintopic  [maxcfgstrsize + 10];  // cached admin topic   "<username>/admin"
+bool  mqtt_hascreds;                     // true if the device remembers a user and password for MQTT
+bool  should_reconnect;                  // true if enough time has pass to reconnect to the MQTT broker
+bool  should_ping;                       // true if the mqtt client should pingback as soon as possible
+char* report_schedule;                   // prepared message detailing the device's schedule
 
 // connect to the MQTT server
 bool mqtt_connect()
@@ -928,7 +963,7 @@ void mqtt_receive(char* topic, byte* payload, unsigned int length)
 				}
 			}
 			else if (length > 9 && strncmp("recurrent", data, 9) == 0) {  // set new recurrent pre-programmed switch
-				// format: recurrent (-|+)(x|z)(0-9) Hour.Minutes Command
+				// format: recurrent (-|+)(x|z)(0-9) Hours.Minutes Command
 				// the first char (-|+) indicates if the timer must be added (+) or removed (-)
 				// the second char (x|z) indicates exact timer or fuzzy match (adds 16-minutes uniform noise)
 				// the third char indicates a day of the week Mon-Sun (1-7), every day (0),
@@ -1070,6 +1105,58 @@ void mqtt_receive(char* topic, byte* payload, unsigned int length)
 				Serial.println("Retrieving status");
 				
 				report_status = (digitalRead(relaypin)) ? "on" : "off";
+			}
+			else if (length == 11 && strncmp("askschedule", data, 11) == 0) {
+				Serial.println("Retrieving schedule");
+				
+				// header: "schedule\n" "nscheduled/maxnscheduled\n" (9 + 2 * len(str(int)) + 2 bytes)
+				// longest recurrent line: "recurrent x9 23.59 off" (22 bytes)
+				// longest timed line:     "timed x 18446744073709551615 off" (32 bytes)
+				// i.e. worst case: header + nscheduled * (32 + 1) [the extra 1 is for \n]
+				// 
+				// assuming a max of 9999999999 scheduled events, i.e. len(str(int)) = 10 (highly unlikely),
+				// this gives 33 * (nscheduled + 1) bytes for the whole message so, 1KiB + 32B
+				// will be enough for 32 events
+				
+				if (report_schedule != nullptr) {
+					free(report_schedule);
+				}
+				
+				report_schedule = static_cast<char*>(malloc(33 * (settings.nscheduled + 1) * sizeof (char)));
+				int i           = 0;
+				int count       = snprintf(&report_schedule[i], 32, "schedule\n%d/%d\n",  // not 33 to leave room for \0 at the end
+				                           settings.nscheduled, maxnscheduled);
+				
+				i += min(32, count);
+				
+				for (int k = 0; k < settings.nscheduled; k++) {
+					ScheduledCmd event = settings.schedule[k];
+					
+					char        fuzzy   = (event.fuzzy) ? 'z' : 'x';
+					const char* command = (event.command == '1') ? "on" :
+					                      (event.command == 't') ? "toggle" :
+					                                               "off";
+					
+					if (event.recurrent) {
+						count = snprintf(&report_schedule[i], 33, "recurrent %c%c %02d.%02d %s\n",
+						                 fuzzy, event.weekday, event.hours, event.minutes, command);
+						i    += min(33, count);
+					}
+					else {
+						count = snprintf(&report_schedule[i], 8, "timed %c ", fuzzy);
+						i    += min(8, count);
+						
+						count = writeull(&report_schedule[i], event.firedate);
+						i    += count;
+						
+						int remaining = 33 - 8 - count;
+						
+						count = snprintf(&report_schedule[i], remaining, " %s\n", command);
+						i    += min(remaining, count);
+					}
+				}
+				
+				report_schedule[i] = 0;
 			}
 			else if (length > 4 && strncmp("time", data, 4) == 0) {  // time synchronization
 				// low-precision, just to keep the device time from drifting away through the year
@@ -1346,6 +1433,7 @@ void setup()
 	should_reconnect   = true;
 	should_ping        = false;
 	report_status      = nullptr;
+	report_schedule    = nullptr;
 	
 	mqtt.setServer(masterhost, masterportmqtt);
 	mqtt.setCallback(mqtt_receive);
@@ -1396,7 +1484,6 @@ void loop()
 		}
 		
 		if (report_status != nullptr) {
-			
 			char message[12];  // max len = 10 -> "status off"
 			int  slen = strlen(report_status);
 			
@@ -1407,6 +1494,13 @@ void loop()
 			mqtt.publish(admintopic, message);
 			
 			report_status = nullptr;
+		}
+		
+		if (report_schedule != nullptr) {
+			mqtt.publish(admintopic, report_schedule);
+			
+			free(report_schedule);
+			report_schedule = nullptr;
 		}
 		
 		if (!mqtt_hascreds && should_askpass) {
