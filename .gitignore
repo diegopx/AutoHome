@@ -1,6 +1,5 @@
 # Files specific to this package
 keys/*
-webserver/keys
 mosquitto.conf
 *.db
 

@@ -130,10 +130,10 @@ allow_duplicate_messages true
 # given, the default listener will not be bound to a specific 
 # address and so will be accessible to all network interfaces.
 # bind_address ip-address/host name
-bind_address $hostname
+bind_address $devhostname
 
 # Port to use for the default listener.
-port $port
+port $devmqttport
 
 # The maximum number of client connections to allow. This is 
 # a per listener setting.
@@ -187,14 +187,14 @@ use_username_as_clientid true
 #
 # not really used, but required to initiate TLS, so use the certfile as
 # dummy CA (the certificate is self-signed)
-cafile $certificate
+cafile $relpath$certificate
 #capath
 
 # Path to the PEM encoded server certificate.
-certfile $certificate
+certfile $relpath$certificate
 
 # Path to the PEM encoded keyfile.
-keyfile $keyfile
+keyfile $relpath$privatekey
 
 # This option defines the version of the TLS protocol to use for this listener.
 # The default value allows v1.2, v1.1 and v1.0, if they are all supported by
@@ -526,13 +526,13 @@ allow_anonymous false
 auth_plugin ./libah-auth-plugin.so
 
 # SQLite3 database file.
-auth_opt_db_file $dbfile
+auth_opt_db_file $relpath$devdbfile
 
 # Superuser name. They have read and write access to every topic.
-auth_opt_superuser $username
+auth_opt_superuser $superuser
 
 # Guest secret key to access the network.
-auth_opt_guest_secret $psk
+auth_opt_guest_secret $devmqttpsk
 
 # -----------------------------------------------------------------
 # Default authentication and topic access control

@@ -1,0 +1,14 @@
+{
+  "superuser": "superuser",
+  "superpass": "superpass",
+  "certificate": "keys/autohome.crt",
+  "privatekey": "keys/autohome.key",
+  "wifissid": "wifiname",
+  "wifipass": "wifipass",
+  
+  "devdbfile": "devcontrol/autohome.db",
+  "devhostname": "autohome.local",
+  "devhttpport": 8266,
+  "devmqttport": 8883,
+  "devmqttpsk": "guest-password"
+}
